@@ -1,3 +1,4 @@
+import os
 import numpy as np
 from datetime import timedelta
 from DHI.Generic.MikeZero import eumUnit
@@ -17,7 +18,7 @@ from .dotnet import (
     to_dotnet_datetime,
     from_dotnet_datetime,
 )
-from .eum import TimeStep, ItemInfo
+from .eum import ItemInfo
 from .helpers import safe_length
 from .dfs import Dfs123
 
@@ -33,7 +34,33 @@ class Dfs2(Dfs123):
         if filename:
             self._read_dfs2_header()
 
+    def __repr__(self):
+        out = ["Dfs2"]
+
+        if self._filename:
+            out.append(f"dx: {self.dx:.5f}")
+            out.append(f"dy: {self.dy:.5f}")
+
+        if self._n_items is not None:
+            if self._n_items < 10:
+                out.append("Items:")
+                for i, item in enumerate(self.items):
+                    out.append(f"  {i}:  {item}")
+            else:
+                out.append(f"Number of items: {self._n_items}")
+        if self._filename:
+            if self._n_timesteps == 1:
+                out.append(f"Time: time-invariant file (1 step)")
+            else:
+                out.append(f"Time: {self._n_timesteps} steps")
+                out.append(f"Start time: {self._start_time}")
+
+        return str.join("\n", out)
+
     def _read_dfs2_header(self):
+        if not os.path.isfile(self._filename):
+            raise Exception(f"file {self._filename} does not exist!")
+
         dfs = DfsFileFactory.Dfs2FileOpen(self._filename)
         self._dx = dfs.SpatialAxis.Dx
         self._dy = dfs.SpatialAxis.Dy
@@ -178,7 +205,6 @@ class Dfs2(Dfs123):
         x0=0,
         y0=0,
         coordinate=None,
-        timeseries_unit=TimeStep.SECOND,
         title=None,
     ):
         """
@@ -194,8 +220,7 @@ class Dfs2(Dfs123):
         start_time: datetime, optional
             start date of type datetime.
         dt: float, optional
-            The time step. Therefore dt of 5.5 with timeseries_unit of TimeStep.MINUTE
-            means 5 mins and 30 seconds. Default 1
+            The time step in seconds.
         datetimes: list[datetime], optional
             datetimes, creates a non-equidistant calendar axis
         items: list[ItemInfo], optional
@@ -210,14 +235,12 @@ class Dfs2(Dfs123):
             length of each grid in the y direction (projection units)
         coordinate:
             ['UTM-33', 12.4387, 55.2257, 327]  for UTM, Long, Lat, North to Y orientation. Note: long, lat in decimal degrees
-        timeseries_unit: Timestep, optional
-            TimeStep default TimeStep.SECOND
         title: str, optional
             title of the dfs2 file. Default is blank.
         """
 
         self._write_handle_common_arguments(
-            title, data, items, coordinate, start_time, dt, timeseries_unit
+            title, data, items, coordinate, start_time, dt
         )
 
         number_y = np.shape(data[0])[1]

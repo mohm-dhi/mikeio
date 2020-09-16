@@ -19,7 +19,7 @@ Facilitates common data processing workflows for MIKE files.
 
 [More info about dependencies](http://docs.mikepoweredbydhi.com/nuget/)
 
-## Important Note!
+## Important note!
 
 The latest version of mikeio (v 0.5), has a lot of new functionality, but also several breaking changes to the API !!
 It was released on 2020-09-03.
@@ -128,6 +128,7 @@ Another [example](notebooks/Dfs2%20-%20Global%20Forecasting%20System.ipynb) of d
 >>>  # The returned ts object is a pandas DataFrame
 >>>  ts = res1d.read('res1dfile.res1d', queries)
 ```
+For more examples on Res1D see this [notebook](notebooks/Res1D.ipynb)
 
 ### Read Xns11 file Return Pandas DataFrame
 ```python
@@ -160,6 +161,24 @@ Another [example](notebooks/Dfs2%20-%20Global%20Forecasting%20System.ipynb) of d
 >>>  plt.plot(ds.time, ds.data[0][:,idx])
 ```
 ![Timeseries](https://raw.githubusercontent.com/DHI/mikeio/master/images/dfsu_ts.png)
+
+```python
+>>>  from mikeio import Mesh
+>>>  msh = Mesh("FakeLake.dfsu")
+>>>  msh.plot()
+```
+![Mesh](https://raw.githubusercontent.com/DHI/mikeio/master/images/FakeLake.png)
+
+
+For more examples on working with dfsu and mesh see these notebooks:
+* [Basic dfsu](notebooks/Dfsu%20-%20Read.ipynb)
+* [3d dfsu](notebooks/Dfsu%20-%203D%20sigma-z.ipynb)
+* [Mesh](notebooks/Mesh.ipynb)
+* [Speed & direction](notebooks/Dfsu%20-%20Speed%20and%20direction.ipynb)
+* [Dfsu and mesh plotting](notebooks/Dfsu%20and%20Mesh%20-%20Plotting.ipynb)
+* [Export to netcdf](notebooks/Dfsu%20-%20Export%20to%20netcdf.ipynb)
+* [Export to shapefile](notebooks/Dfsu%20-%20Export%20to%20shapefile.ipynb)
+
 
 ## Items, units
  Useful when creating a new dfs file

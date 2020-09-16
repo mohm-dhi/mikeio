@@ -1,3 +1,4 @@
+import os
 import numpy as np
 from datetime import timedelta
 
@@ -17,7 +18,7 @@ from .dotnet import (
     to_dotnet_datetime,
     from_dotnet_datetime,
 )
-from .eum import TimeStep, ItemInfo
+from .eum import ItemInfo
 from .helpers import safe_length
 from .dfs import Dfs123
 
@@ -32,7 +33,33 @@ class Dfs1(Dfs123):
         if filename:
             self._read_dfs1_header()
 
+    def __repr__(self):
+        out = ["Dfs1"]
+
+        if self._filename:
+            pass
+            out.append(f"dx: {self.dx:.5f}")
+
+        if self._n_items is not None:
+            if self._n_items < 10:
+                out.append("Items:")
+                for i, item in enumerate(self.items):
+                    out.append(f"  {i}:  {item}")
+            else:
+                out.append(f"Number of items: {self._n_items}")
+        if self._filename:
+            if self._n_timesteps == 1:
+                out.append(f"Time: time-invariant file (1 step)")
+            else:
+                out.append(f"Time: {self._n_timesteps} steps")
+                out.append(f"Start time: {self._start_time}")
+
+        return str.join("\n", out)
+
     def _read_dfs1_header(self):
+        if not os.path.isfile(self._filename):
+            raise Exception(f"file {self._filename} does not exist!")
+
         dfs = DfsFileFactory.Dfs1FileOpen(self._filename)
         self._dx = dfs.SpatialAxis.Dx
 
@@ -122,7 +149,6 @@ class Dfs1(Dfs123):
         dx=1,
         x0=0,
         coordinate=None,
-        timeseries_unit=TimeStep.SECOND,
         title=None,
     ):
         """
@@ -136,11 +162,8 @@ class Dfs1(Dfs123):
             list of matrices, one for each item. Matrix dimension: x, time
         start_time: datetime, optional
             start datetime
-        timeseries_unit: Timestep, optional
-            TimeStep unit default TimeStep.SECOND
         dt: float
-            The time step (double based on the timeseries_unit). Therefore dt of 5.5 with timeseries_unit of minutes
-            means 5 mins and 30 seconds.
+            The time step in seconds. 
         items: list[ItemInfo], optional
             List of ItemInfo corresponding to a variable types (ie. Water Level).
         coordinate:
@@ -155,7 +178,7 @@ class Dfs1(Dfs123):
         """
 
         self._write_handle_common_arguments(
-            title, data, items, coordinate, start_time, dt, timeseries_unit
+            title, data, items, coordinate, start_time, dt
         )
 
         number_x = np.shape(data[0])[1]
@@ -195,3 +218,10 @@ class Dfs1(Dfs123):
                 dfs.WriteItemTimeStepNext(0, darray)
 
         dfs.Close()
+
+    @property
+    def dx(self):
+        """Step size in x direction
+        """
+        return self._dx
+

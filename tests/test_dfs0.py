@@ -4,10 +4,30 @@ import pandas as pd
 import datetime
 import mikeio
 from mikeio.dfs0 import Dfs0
-from mikeio.eum import TimeStep, EUMType, EUMUnit, ItemInfo
+from mikeio.eum import TimeStepUnit, EUMType, EUMUnit, ItemInfo
 from datetime import timedelta
 
 import pytest
+
+
+def test_repr():
+    filename = os.path.join("tests", "testdata", "da_diagnostic.dfs0")
+    dfs = Dfs0(filename)
+
+    text = repr(dfs)
+
+    assert "NonEquidistant" in text
+
+
+def test_repr_equidistant():
+    filename = os.path.join("tests", "testdata", "random.dfs0")
+    dfs = Dfs0(filename)
+
+    text = repr(dfs)
+
+    assert "Dfs0" in text
+    assert "Equidistant" in text
+    assert "NonEquidistant" not in text
 
 
 def test_simple_write(tmpdir):
@@ -88,7 +108,7 @@ def test_write_timestep_7days(tmpdir):
         data=data,
         items=items,
         title="Zeros and ones",
-        timeseries_unit=TimeStep.DAY,
+        timeseries_unit=TimeStepUnit.DAY,
         dt=7,
     )
 
@@ -274,6 +294,7 @@ def test_write_from_data_frame_monkey_patched(tmpdir):
     assert ds.items[0].type == EUMType.Concentration
     assert ds.items[0].unit == EUMUnit.gram_per_meter_pow_3
     assert np.isnan(ds["Average"][3])
+    assert ds.time[0].year == 1958
 
 
 def test_write_from_data_frame_different_types(tmpdir):
