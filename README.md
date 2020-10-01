@@ -10,7 +10,7 @@ Read, write and manipulate dfs0, dfs1, dfs2, dfs3, dfsu and mesh files. Read res
 
 Facilitates common data processing workflows for MIKE files.
 
-
+[![Blue cafe](https://raw.githubusercontent.com/DHI/mikeio/master/images/bluecafe.png)](https://www.youtube.com/watch?v=7WJpeydHMYQ)
 
 ## Requirements
 * Windows operating system
@@ -19,11 +19,10 @@ Facilitates common data processing workflows for MIKE files.
 
 [More info about dependencies](http://docs.mikepoweredbydhi.com/nuget/)
 
-## Important note!
+## Where can I get help?
 
-The latest version of mikeio (v 0.5), has a lot of new functionality, but also several breaking changes to the API !!
-It was released on 2020-09-03.
-
+* Bugs & feature request - [GitHub Issues](http://github.com/DHI/mikeio/issues) 
+* General help, FAQ [Stackoverflow with the tag `mikeio`](https://stackoverflow.com/questions/tagged/mikeio)
 
 ## Installation
 
