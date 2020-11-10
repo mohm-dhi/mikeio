@@ -1,9 +1,10 @@
+import os
 from datetime import datetime
 from dateutil.rrule import rrule, SECONDLY, HOURLY, DAILY
 import numpy as np
 import pandas as pd
 import pytest
-from mikeio.dutil import Dataset
+from mikeio import Dataset, Dfsu, Dfs2
 from mikeio.eum import EUMType, ItemInfo, EUMUnit
 
 
@@ -96,6 +97,20 @@ def test_temporal_subset_fancy():
 
     selds = ds["2000-01-30":]
     assert selds["Foo"].shape == (49, 100, 30)
+
+
+def test_subset_with_datetime_is_not_supported():
+    nt = (24 * 31) + 1
+    d1 = np.zeros([nt, 100, 30]) + 1.5
+    d2 = np.zeros([nt, 100, 30]) + 2.0
+    data = [d1, d2]
+
+    time = list(rrule(freq=HOURLY, count=nt, dtstart=datetime(2000, 1, 1)))
+    items = [ItemInfo("Foo"), ItemInfo("Bar")]
+    ds = Dataset(data, time, items)
+
+    with pytest.raises(ValueError):
+        ds[datetime(2000, 1, 1)]
 
 
 def test_select_item_by_name():
@@ -213,6 +228,19 @@ def test_to_dataframe():
 
     assert list(df.columns) == ["Foo", "Bar"]
     assert isinstance(df.index, pd.DatetimeIndex)
+
+
+def test_multidimensional_to_dataframe_no_supported():
+
+    nt = 100
+    d1 = np.zeros([nt, 2])
+
+    time = _get_time(nt)
+    items = [ItemInfo("Foo")]
+    ds = Dataset([d1], time, items)
+
+    with pytest.raises(ValueError):
+        ds.to_dataframe()
 
 
 def test_get_data():
@@ -366,6 +394,175 @@ def test_get_bad_name():
         ds["BAR"]
 
 
+def test_head():
+
+    nt = 100
+    data = []
+    d = np.zeros([nt, 100, 30]) + 1.0
+    data.append(d)
+    time = _get_time(nt)
+    items = [ItemInfo("Foo")]
+    ds = Dataset(data, time, items)
+
+    dshead = ds.head()
+
+    assert len(dshead.time) == 5
+    assert ds.time[0] == dshead.time[0]
+
+    dshead10 = ds.head(n=10)
+
+    assert len(dshead10.time) == 10
+
+
+def test_head_small_dataset():
+
+    nt = 2
+    data = []
+    d = np.zeros([nt, 100, 30]) + 1.0
+    data.append(d)
+    time = _get_time(nt)
+    items = [ItemInfo("Foo")]
+    ds = Dataset(data, time, items)
+
+    dshead = ds.head()
+
+    assert len(dshead.time) == nt
+
+
+def test_tail():
+
+    nt = 100
+    data = []
+    d = np.zeros([nt, 100, 30]) + 1.0
+    data.append(d)
+    time = _get_time(nt)
+    items = [ItemInfo("Foo")]
+    ds = Dataset(data, time, items)
+
+    dstail = ds.tail()
+
+    assert len(dstail.time) == 5
+    assert ds.time[-1] == dstail.time[-1]
+
+    dstail10 = ds.tail(n=10)
+
+    assert len(dstail10.time) == 10
+
+
+def test_thin():
+
+    nt = 100
+    data = []
+    d = np.zeros([nt, 100, 30]) + 1.0
+    data.append(d)
+    time = _get_time(nt)
+    items = [ItemInfo("Foo")]
+    ds = Dataset(data, time, items)
+
+    dsthin = ds.thin(2)
+
+    assert len(dsthin.time) == 50
+
+
+def test_tail_small_dataset():
+    nt = 2
+    data = []
+    d = np.zeros([nt, 100, 30]) + 1.0
+    data.append(d)
+    time = _get_time(nt)
+    items = [ItemInfo("Foo")]
+    ds = Dataset(data, time, items)
+
+    dstail = ds.tail()
+
+    assert len(dstail.time) == nt
+
+
+def test_flipud():
+
+    nt = 2
+    d = np.random.random([nt, 100, 30])
+    time = _get_time(nt)
+    items = [ItemInfo("Foo")]
+    ds = Dataset([d], time, items)
+
+    dsud = ds.copy()
+    dsud.flipud()
+
+    assert dsud.shape == ds.shape
+    assert dsud["Foo"][0, 0, 0] == ds["Foo"][0, -1, 0]
+
+
+def test_aggregation_workflows(tmpdir):
+    filename = "tests/testdata/HD2D.dfsu"
+    dfs = Dfsu(filename)
+
+    ds = dfs.read(["Surface elevation", "Current speed"])
+    ds2 = ds.max()
+
+    outfilename = os.path.join(tmpdir.dirname, "max.dfs0")
+    ds2.to_dfs0(outfilename)
+    assert os.path.isfile(outfilename)
+
+    ds3 = ds.min()
+
+    outfilename = os.path.join(tmpdir.dirname, "min.dfs0")
+    ds3.to_dfs0(outfilename)
+    assert os.path.isfile(outfilename)
+
+
+def test_aggregations(tmpdir):
+    filename = "tests/testdata/gebco_sound.dfs2"
+    dfs = Dfs2(filename)
+
+    ds = dfs.read()
+
+    for axis in [0, 1, 2]:
+        ds.mean(axis=axis)
+        ds.nanmean(axis=axis)
+        ds.nanmin(axis=axis)
+        ds.nanmax(axis=axis)
+
+    assert True
+
+
+def test_weighted_average(tmpdir):
+    filename = "tests/testdata/HD2D.dfsu"
+    dfs = Dfsu(filename)
+
+    ds = dfs.read(["Surface elevation", "Current speed"])
+
+    area = dfs.get_element_area()
+    ds2 = ds.average(weights=area)
+
+    outfilename = os.path.join(tmpdir.dirname, "average.dfs0")
+    ds2.to_dfs0(outfilename)
+    assert os.path.isfile(outfilename)
+
+
+def test_copy():
+    nt = 100
+    d1 = np.zeros([nt, 100, 30]) + 1.5
+    d2 = np.zeros([nt, 100, 30]) + 2.0
+
+    data = [d1, d2]
+
+    time = _get_time(nt)
+    items = [ItemInfo("Foo"), ItemInfo("Bar")]
+    ds = Dataset(data, time, items)
+
+    assert len(ds.items) == 2
+    assert len(ds.data) == 2
+    assert ds.items[0].name == "Foo"
+
+    ds2 = ds.copy()
+
+    ds2.items[0].name = "New name"
+
+    assert ds2.items[0].name == "New name"
+    assert ds.items[0].name == "Foo"
+
+
 def test_default_type():
 
     item = ItemInfo("Foo")
@@ -436,3 +633,80 @@ def test_item_search():
 
     assert len(res) > 0
     assert isinstance(res[0], EUMType)
+
+
+def test_dfsu3d_dataset():
+
+    filename = "tests/testdata/oresund_sigma_z.dfsu"
+
+    dfsu = Dfsu(filename)
+
+    ds = dfsu.read()
+
+    text = repr(ds)
+
+    assert len(ds) == 3  # Z coordinate, Salinity, Temperature
+
+    dsagg = ds.nanmean(axis=0)  # Time averaged
+
+    assert len(dsagg) == 2  # Salinity, Temperature
+
+    assert dsagg[0].shape[0] == 1
+
+    assert dsagg.time[0] == ds.time[0]  # Time-averaged data index by start time
+
+    ds_elm = dfsu.read(elements=[0])
+
+    assert len(ds_elm) == 3  # Z coordinate, Salinity, Temperature
+
+    dss = ds_elm.squeeze()
+
+    assert len(dss) == 2  # Salinity, Temperature
+
+
+def test_items_data_mismatch():
+
+    nt = 100
+    d = np.zeros([nt, 100, 30]) + 1.0
+    time = _get_time(nt)
+    items = [ItemInfo("Foo"), ItemInfo("Bar")]  # Two items is not correct!
+
+    with pytest.raises(ValueError):
+        Dataset([d], time, items)
+
+
+def test_time_data_mismatch():
+
+    nt = 100
+    d = np.zeros([nt, 100, 30]) + 1.0
+    time = _get_time(nt + 1)  # 101 timesteps is not correct!
+    items = [ItemInfo("Foo")]
+
+    with pytest.raises(ValueError):
+        Dataset([d], time, items)
+
+
+def test_properties_dfs2():
+    filename = "tests/testdata/gebco_sound.dfs2"
+    dfs = Dfs2(filename)
+
+    ds = dfs.read()
+    assert ds.n_timesteps == 1
+    assert ds.n_items == 1
+    assert np.all(ds.shape == (1, 264, 216))
+    assert ds.n_elements == (264 * 216)
+    assert ds._first_non_z_item == 0
+    assert ds.is_equidistant
+
+
+def test_properties_dfsu():
+    filename = "tests/testdata/oresund_vertical_slice.dfsu"
+    dfs = Dfsu(filename)
+
+    ds = dfs.read()
+    assert ds.n_timesteps == 3
+    assert ds.n_items == 3
+    assert np.all(ds.shape == (3, 441))
+    assert ds.n_elements == 441
+    assert ds._first_non_z_item == 1
+    assert ds.is_equidistant

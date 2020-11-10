@@ -1,15 +1,19 @@
+from logging import warn
 import os
+import pandas as pd
 from enum import IntEnum
 import warnings
 import numpy as np
 from datetime import datetime, timedelta
+from scipy.spatial import cKDTree
 
 from DHI.Generic.MikeZero import eumUnit, eumQuantity
 from DHI.Generic.MikeZero.DFS import DfsFileFactory, DfsFactory
 from DHI.Generic.MikeZero.DFS.dfsu import DfsuFile, DfsuFileType, DfsuBuilder, DfsuUtil
 from DHI.Generic.MikeZero.DFS.mesh import MeshFile, MeshBuilder
 
-from .dutil import Dataset, get_item_info, get_valid_items_and_timesteps
+from .dutil import get_item_info, get_valid_items_and_timesteps
+from .dataset import Dataset
 from .dotnet import (
     to_numpy,
     to_dotnet_float_array,
@@ -19,8 +23,12 @@ from .dotnet import (
     to_dotnet_array,
     asnetarray_v2,
 )
+from .dfs0 import Dfs0
 from .eum import ItemInfo, EUMType, EUMUnit
 from .helpers import safe_length
+from .spatial import Grid2D
+from .interpolation import get_idw_interpolant, interp2d
+from .custom_exceptions import InvalidGeometry
 
 
 class UnstructuredType(IntEnum):
@@ -69,6 +77,9 @@ class _UnstructuredGeometry:
     _e2_e3_table = None
     _2d_ids = None
     _layer_ids = None
+
+    _shapely_domain_obj = None
+    _tree2d = None
 
     def __repr__(self):
         out = []
@@ -177,6 +188,14 @@ class _UnstructuredGeometry:
         """Does the mesh consist of triangles only?
         """
         return self.max_nodes_per_element == 3 or self.max_nodes_per_element == 6
+
+    @property
+    def _shapely_domain2d(self):
+        """
+        """
+        if self._shapely_domain_obj is None:
+            self._shapely_domain_obj = self.to_shapely().buffer(0)
+        return self._shapely_domain_obj
 
     def get_node_coords(self, code=None):
         """Get the coordinates of each node.
@@ -372,8 +391,7 @@ class _UnstructuredGeometry:
             2d geometry (bottom nodes)
         """
         if self._n_layers is None:
-            print("Object has no layers: cannot export to_2d_geometry")
-            return None
+            return self
 
         # extract information for selected elements
         elem_ids = self.bottom_elements
@@ -488,118 +506,254 @@ class _UnstructuredGeometry:
         self._ec = ec
         return ec
 
-    def _find_n_nearest_elements(self, x, y, z=None, n=1, layer=None):
-        """Find n nearest elements (for each of the points given) 
+    def contains(self, points):
+        """test if a list of points are contained by mesh
 
         Parameters
         ----------
-
-        x: float or list(float)
-            X coordinate(s) (easting or longitude)
-        y: float or list(float)
-            Y coordinate(s) (northing or latitude)
-        z: float or list(float), optional
-            Z coordinate(s)  (vertical coordinate, positive upwards)
-            If not provided for a 3d file, the surface element is returned
-        layer: int, optional
-            Search in a specific layer only (3D files only)
+        points : array-like n-by-2
+            x,y-coordinates of n points to be tested
 
         Returns
         -------
-        np.array
-            element ids of nearest element(s)            
+        bool array
+            True for points inside, False otherwise
         """
-        ec = self.element_coordinates
+        import matplotlib.path as mp
 
-        if self.is_2d:
-            poi = np.array([x, y])
+        try:
+            domain = self._shapely_domain2d
+        except:
+            warnings.warn(
+                "Could not determine if domain contains points. Failed to convert to_shapely()"
+            )
+            return None
 
-            d = ((ec[:, 0:2] - poi) ** 2).sum(axis=1)
-            idx = d.argsort()[0:n]
+        cnts = mp.Path(domain.exterior).contains_points(points)
+        for interj in domain.interiors:
+            in_hole = mp.Path(interj).contains_points(points)
+            cnts = np.logical_and(cnts, ~in_hole)
+        return cnts
+
+    def get_overset_grid(self, dxdy=None, shape=None, buffer=None):
+        """get a 2d grid that covers the domain by specifying spacing or shape
+
+        Parameters
+        ----------
+        dxdy : float or (float, float), optional
+            grid resolution in x- and y-direction
+        shape : (int, int), optional
+            tuple with nx and ny describing number of points in each direction
+            one of them can be None, in which case the value will be inferred
+        buffer : float, optional
+            positive to make the area larger, default=0
+            can be set to a small negative value to avoid NaN 
+            values all around the domain.
+
+        Returns
+        -------
+        <mikeio.Grid2D>
+            2d grid
+        """
+        nc = self.geometry2d.node_coordinates
+        bbox = Grid2D.xy_to_bbox(nc, buffer=buffer)
+        return Grid2D(bbox=bbox, dxdy=dxdy, shape=shape)
+
+    def get_2d_interpolant(self, xy, n_nearest: int = 1, extrapolate=False):
+        """IDW interpolant for list of coordinates
+
+        Parameters
+        ----------
+        xy : array-like 
+            x,y coordinates of new points 
+        n_nearest : int, optional
+            [description], by default 1
+        extrapolate : bool, optional
+            allow , by default False
+
+        Returns
+        -------
+        (np.array, np.array)
+            element ids and weights 
+        """
+        ids, dists = self._find_n_nearest_2d_elements(xy, n=n_nearest)
+        weights = None
+
+        if n_nearest == 1:
+            weights = np.ones(dists.shape)
+            if not extrapolate:
+                weights[~self.contains(xy)] = np.nan
+        elif n_nearest > 1:
+            weights = get_idw_interpolant(dists)
+            if not extrapolate:
+                weights[~self.contains(xy), :] = np.nan
         else:
-            poi = np.array([x, y])
+            ValueError("n_nearest must be at least 1")
 
-            ec = self.geometry2d.element_coordinates
-            d2d = ((ec[:, 0:2] - poi) ** 2).sum(axis=1)
-            elem2d = d2d.argsort()[0:n]  # n nearest 2d elements
+        return ids, weights
 
-            if layer is None:
-                # TODO: loop over 2d elements, to get n lateral 3d neighbors
-                elem3d = self.e2_e3_table[elem2d[0]]
-                zc = self.element_coordinates[elem3d, 2]
+    def interp2d(self, data, elem_ids, weights=None, shape=None):
+        """interp spatially in data (2d only)
 
-                if z is None:
-                    z = 0  # should we rarther return whole column?
-                d3d = np.abs(z - zc)
-                idx = elem3d[d3d.argsort()[0]]
-            else:
-                # 3d elements for n nearest 2d elements
+        Parameters
+        ----------
+        data : ndarray or list(ndarray)
+            dfsu data 
+        elem_ids : ndarray(int)
+            n sized array of 1 or more element ids used for interpolation
+        weights : ndarray(float), optional
+            weights with same size as elem_ids used for interpolation
+        shape: tuple, optional
+            reshape output
+
+        Returns
+        -------
+        ndarray or list(ndarray)
+            spatially interped data
+        
+        Examples
+        --------
+        >>> ds = dfsu.read()
+        >>> g = dfs.get_overset_grid(shape=(50,40))
+        >>> elem_ids, weights = dfs.get_2d_interpolant(g.xy)
+        >>> dsi = dfs.interp2d(ds, elem_ids, weights)
+        """
+        return interp2d(data, elem_ids, weights, shape)
+
+    def _create_tree2d(self):
+        xy = self.geometry2d.element_coordinates[:, :2]
+        self._tree2d = cKDTree(xy)
+
+    def _find_n_nearest_2d_elements(self, x, y=None, n=1):
+        if self._tree2d is None:
+            self._create_tree2d()
+
+        if y is None:
+            p = x
+            if (not np.isscalar(x)) and (np.ndim(x) == 2):
+                p = x[:, 0:2]
+        else:
+            p = np.array((x, y)).T
+        d, elem_id = self._tree2d.query(p, k=n)
+        return elem_id, d
+
+    def _find_3d_from_2d_points(self, elem2d, z=None, layer=None):
+
+        was_scalar = np.isscalar(elem2d)
+        if was_scalar:
+            elem2d = np.array([elem2d])
+        else:
+            orig_shape = elem2d.shape
+            elem2d = np.reshape(elem2d, (elem2d.size,))
+
+        if (layer is None) and (z is None):
+            # return top element
+            idx = self.top_elements[elem2d]
+
+        elif layer is None:
+            idx = np.zeros_like(elem2d)
+            if np.isscalar(z):
+                z = z * np.ones_like(elem2d, dtype=float)
+            elem3d = self.e2_e3_table[elem2d]
+            for j, row in enumerate(elem3d):
+                zc = self.element_coordinates[row, 2]
+                d3d = np.abs(z[j] - zc)
+                idx[j] = row[d3d.argsort()[0]]
+
+        elif z is None:
+            if 1 <= layer <= self.n_z_layers:
+                idx = np.zeros_like(elem2d)
                 elem3d = self.e2_e3_table[elem2d]
-                elem3d = np.concatenate(elem3d, axis=0)
-                layer_ids = self.layer_ids[elem3d]
-                idx = elem3d[layer_ids == layer]  # return at most n ids
+                for j, row in enumerate(elem3d):
+                    try:
+                        layer_ids = self.layer_ids[elem3d]
+                        id = elem3d[layer_ids == layer]
+                        idx[j] = id
+                    except:
+                        print(f"Layer {layer} not present for 2d element {elem2d[j]}")
+            else:
+                # sigma layer
+                idx = self.get_layer_elements(layer=layer)[elem2d]
 
-        if n == 1 and (not np.isscalar(idx)):
+        else:
+            raise ValueError("layer and z cannot both be supplied!")
+
+        if was_scalar:
             idx = idx[0]
+        else:
+            idx = np.reshape(idx, orig_shape)
+
         return idx
 
-    def find_nearest_element(self, x, y, z=None, layer=None):
-        """Find index of nearest element (optionally for a list)
+    def find_nearest_element(self, x, y, z=None, layer=None, n_nearest=1):
+        warnings.warn("OBSOLETE! method name changed to find_nearest_elements")
+        return self.find_nearest_elements(x, y, z, layer, n_nearest)
+
+    def find_nearest_elements(
+        self, x, y=None, z=None, layer=None, n_nearest=1, return_distances=False
+    ):
+        """Find index of nearest elements (optionally for a list)
 
         Parameters
         ----------
 
-        x: float or list(float)
+        x: float or array(float)
             X coordinate(s) (easting or longitude)
-        y: float or list(float)
+        y: float or array(float)
             Y coordinate(s) (northing or latitude)
-        z: float or list(float), optional
+        z: float or array(float), optional
             Z coordinate(s)  (vertical coordinate, positive upwards)
             If not provided for a 3d file, the surface element is returned
         layer: int, optional
             Search in a specific layer only (3D files only)
+            Either z or layer can be provided for a 3D file
+        n_nearest : int, optional
+            return this many (horizontally) nearest points for 
+            each coordinate set, default=1
+        return_distances : bool, optional
+            should the horizontal distances to each point be returned?
+            default=False
 
         Returns
         -------
         np.array
             element ids of nearest element(s)
+        np.array, optional
+            horizontal distances 
+
+        Examples
+        --------
+        >>> id = dfs.find_nearest_elements(3, 4)
+        >>> ids = dfs.find_nearest_elements([3, 8], [4, 6])
+        >>> ids = dfs.find_nearest_elements(xy)
+        >>> ids = dfs.find_nearest_elements(3, 4, n_nearest=4)
+        >>> ids, d = dfs.find_nearest_elements(xy, return_distances=True)
+        
+        >>> ids = dfs.find_nearest_elements(3, 4, z=-3)
+        >>> ids = dfs.find_nearest_elements(3, 4, layer=4)
+        >>> ids = dfs.find_nearest_elements(xyz)
+        >>> ids = dfs.find_nearest_elements(xyz, n_nearest=3)
         """
-        if np.isscalar(x):
-            return self._find_n_nearest_elements(x, y, z, n=1, layer=layer)
-        else:
-            nx = len(x)
-            ny = len(y)
-            if nx != ny:
-                print(f"x and y must have same length")
-                raise Exception
-            idx = np.zeros(nx, dtype=int)
-            if z is None:
-                for j in range(nx):
-                    idx[j] = self._find_n_nearest_elements(
-                        x[j], y[j], z=None, n=1, layer=layer
-                    )
-            else:
-                nz = len(z)
-                if nx != nz:
-                    print(f"z must have same length as x and y")
-                for j in range(nx):
-                    idx[j] = self._find_n_nearest_elements(
-                        x[j], y[j], z[j], n=1, layer=layer
-                    )
+        idx, d2d = self._find_n_nearest_2d_elements(x, y, n=n_nearest)
+
+        if not self.is_2d:
+            if self._use_third_col_as_z(x, z, layer):
+                z = x[:, 2]
+            idx = self._find_3d_from_2d_points(idx, z=z, layer=layer)
+
+        if return_distances:
+            return idx, d2d
+
         return idx
 
-    # def _find_nearest_2d_element(self, x, y):
-    #     if self.is_2d:
-    #         return self.find_nearest_element(x, y)
-    #     else:
-    #         geom2d = self.geometry2d
-    #         return geom2d.find_nearest_element(x, y)
-
-    # def _get_profile_from_2d_element(self, elem2d):
-    #     if self.is_2d:
-    #         raise Exception("Object is 2d. Cannot get_profile_from_2d_element")
-    #     else:
-    #         return self.e2_e3_table[elem2d]
+    def _use_third_col_as_z(self, x, z, layer):
+        return (
+            (z is None)
+            and (layer is None)
+            and (not np.isscalar(x))
+            and (np.ndim(x) == 2)
+            and (x.shape[1] >= 3)
+        )
 
     def find_nearest_profile_elements(self, x, y):
         """Find 3d elements of profile nearest to (x,y) coordinates
@@ -617,9 +771,9 @@ class _UnstructuredGeometry:
             element ids of vertical profile
         """
         if self.is_2d:
-            raise Exception("Object is 2d. Cannot get_nearest_profile")
+            raise InvalidGeometry("Object is 2d. Cannot get_nearest_profile")
         else:
-            elem2d = self.geometry2d.find_nearest_element(x, y)
+            elem2d, _ = self._find_n_nearest_2d_elements(x, y)
             elem3d = self.e2_e3_table[elem2d]
             return elem3d
 
@@ -695,8 +849,7 @@ class _UnstructuredGeometry:
         """The 2d geometry for a 3d object
         """
         if self._n_layers is None:
-            print("Object has no layers: cannot return geometry2d")
-            return None
+            return self
         if self._geom2d is None:
             self._geom2d = self.to_2d_geometry()
         return self._geom2d
@@ -720,8 +873,9 @@ class _UnstructuredGeometry:
         """The associated 2d element id for each 3d element
         """
         if self._n_layers is None:
-            print("Object has no layers: cannot return elem2d_ids")
-            return None
+            raise InvalidGeometry("Object has no layers: cannot return elem2d_ids")
+            # or return self._2d_ids ??
+
         if self._2d_ids is None:
             res = self._get_2d_to_3d_association()
             self._e2_e3_table = res[0]
@@ -734,8 +888,7 @@ class _UnstructuredGeometry:
         """The layer number for each 3d element
         """
         if self._n_layers is None:
-            print("Object has no layers: cannot return layer_ids")
-            return None
+            raise InvalidGeometry("Object has no layers: cannot return layer_ids")
         if self._layer_ids is None:
             res = self._get_2d_to_3d_association()
             self._e2_e3_table = res[0]
@@ -825,18 +978,17 @@ class _UnstructuredGeometry:
 
         n_lay = self.n_layers
         if n_lay is None:
-            print("Object has no layers: cannot get_layer_elements")
-            return None
+            raise InvalidGeometry("Object has no layers: cannot get_layer_elements")
 
-        if layer < (-n_lay+1) or layer > n_lay:
+        if layer < (-n_lay + 1) or layer > n_lay:
             raise Exception(
                 f"Layer {layer} not allowed; must be between -{n_lay-1} and {n_lay}"
             )
 
-        if layer <=0:
+        if layer <= 0:
             layer = layer + n_lay
 
-        return self.element_ids[self.layer_ids==layer]
+        return self.element_ids[self.layer_ids == layer]
 
     def _get_2d_to_3d_association(self):
         e2_to_e3 = (
@@ -847,9 +999,10 @@ class _UnstructuredGeometry:
         n2d = len(self.top_elements)
         topid = self.top_elements
         botid = self.bottom_elements
-        global_layer_ids = np.arange(1, self.n_layers + 1)  # layer_ids = 1, 2, 3...
+        # layer_ids = 1, 2, 3...
+        global_layer_ids = np.arange(1, self.n_layers + 1)
         for j in range(n2d):
-            col = np.array(list(range(botid[j], topid[j] + 1)))
+            col = list(range(botid[j], topid[j] + 1))
 
             e2_to_e3.append(col)
             for jj in col:
@@ -980,7 +1133,7 @@ class _UnstructuredGeometry:
         ax=None,
     ):
         """
-        Plot mesh elements
+        Plot unstructured data and/or mesh, mesh outline  
 
         Parameters
         ----------
@@ -1015,6 +1168,10 @@ class _UnstructuredGeometry:
             specify size of figure
         ax: matplotlib.axes, optional
             Adding to existing axis, instead of creating new fig
+
+        Returns
+        -------
+        <matplotlib.axes>          
         """
 
         import matplotlib.cm as cm
@@ -1070,9 +1227,9 @@ class _UnstructuredGeometry:
                 print(f"Cannot plot data in {plot_type} plot!")
 
         if plot_data and vmin is None:
-            vmin = z.min()
+            vmin = np.nanmin(z)
         if plot_data and vmax is None:
-            vmax = z.max()
+            vmax = np.nanmax(z)
 
         # set levels
         if "contour" in plot_type:
@@ -1092,12 +1249,12 @@ class _UnstructuredGeometry:
 
         # set aspect ratio
         if geometry.is_geo:
-            mean_lat = np.mean(nc[:,1]) 
+            mean_lat = np.mean(nc[:, 1])
             ax.set_aspect(1.0 / np.cos(np.pi * mean_lat / 180))
         else:
             ax.set_aspect("equal")
 
-        # set plot limits   
+        # set plot limits
         xmin, xmax = nc[:, 0].min(), nc[:, 0].max()
         ymin, ymax = nc[:, 1].min(), nc[:, 1].max()
 
@@ -1187,7 +1344,8 @@ class _UnstructuredGeometry:
             elif plot_type == "contourf" or plot_type == "contour_filled":
                 ax.triplot(triang, lw=mesh_linewidth, color=mesh_col)
                 vbuf = 0.01 * (vmax - vmin) / n_levels
-                zn = np.clip(zn, vmin + vbuf, vmax - vbuf)  # avoid white outside limits
+                # avoid white outside limits
+                zn = np.clip(zn, vmin + vbuf, vmax - vbuf)
                 fig_obj = ax.tricontourf(triang, zn, levels=levels, cmap=cmap)
 
                 # colorbar
@@ -1214,24 +1372,21 @@ class _UnstructuredGeometry:
 
         if show_outline:
             try:
-                if not self.is_2d:
-                    geometry = self.geometry2d
-                mp = geometry.to_shapely()
-                domain = mp.buffer(0)
+                domain = self._shapely_domain2d
             except:
-                warnings.warn('Could not plot outline. Failed to convert to_shapely()')
+                warnings.warn("Could not plot outline. Failed to convert to_shapely()")
             try:
                 if domain:
                     out_col = "0.4"
                     ax.plot(*domain.exterior.xy, color=out_col, linewidth=1.2)
-                    xd, yd = domain.exterior.xy[0], domain.exterior.xy[1]                    
-                    xmin, xmax = min(xmin,np.min(xd)), max(xmax,np.max(xd))
-                    ymin, ymax = min(ymin,np.min(yd)), max(ymax,np.max(yd))
+                    xd, yd = domain.exterior.xy[0], domain.exterior.xy[1]
+                    xmin, xmax = min(xmin, np.min(xd)), max(xmax, np.max(xd))
+                    ymin, ymax = min(ymin, np.min(yd)), max(ymax, np.max(yd))
                     for j in range(len(domain.interiors)):
                         interj = domain.interiors[j]
                         ax.plot(*interj.xy, color=out_col, linewidth=1.2)
             except:
-                warnings.warn('Could not plot outline')
+                warnings.warn("Could not plot outline")
 
         # set plot limits
         xybuf = 6e-3 * (xmax - xmin)
@@ -1241,7 +1396,7 @@ class _UnstructuredGeometry:
         if title is not None:
             ax.set_title(title)
 
-        return fig_obj, ax
+        return ax
 
     def _create_tri_only_element_table(self, data=None, geometry=None):
         """Convert quad/tri mesh to pure tri-mesh
@@ -1499,8 +1654,6 @@ class Dfsu(_UnstructuredFile):
 
         Parameters
         ---------
-        filename: str
-            dfsu filename
         items: list[int] or list[str], optional
             Read only selected items, by number (0-based), or by name
         time_steps: int or list[int], optional
@@ -1606,6 +1759,223 @@ class Dfsu(_UnstructuredFile):
         dfs.Close()
         return Dataset(data_list, time, items)
 
+    def extract_track(self, track, items=None, method="nearest"):
+        """
+        Extract track data from a dfsu file
+
+        Parameters
+        ---------
+        track: pandas.DataFrame
+            with DatetimeIndex and (x, y) of track points as first two columns
+            x,y coordinates must be in same coordinate system as dfsu
+        track: str 
+            filename of csv or dfs0 file containing t,x,y        
+        items: list[int] or list[str], optional
+            Extract only selected items, by number (0-based), or by name
+        method: str, optional
+            Spatial interpolation method ('nearest' or 'inverse_distance')
+            default='nearest'
+
+        Returns
+        -------
+        Dataset
+            A dataset with data dimension t
+            The first two items will be x- and y- coordinates of track
+
+        Examples
+        --------
+        >>> ds = dfsu.extract_track(times, xy, items=['u','v'])
+
+        >>> ds = dfsu.extract_track('track_file.dfs0')
+
+        >>> ds = dfsu.extract_track('track_file.csv', items=0)
+        """
+
+        dfs = DfsuFile.Open(self._filename)
+        self._n_timesteps = dfs.NumberOfTimeSteps
+
+        items, item_numbers, time_steps = get_valid_items_and_timesteps(
+            self, items, time_steps=None
+        )
+        n_items = len(item_numbers)
+
+        deletevalue = self.deletevalue
+
+        if isinstance(track, str):
+            filename = track
+            if os.path.exists(filename):
+                _, ext = os.path.splitext(filename)
+                if ext == ".dfs0":
+                    df = Dfs0(filename).to_dataframe()
+                elif ext == ".csv":
+                    df = pd.read_csv(filename, index_col=0, parse_dates=True)
+                else:
+                    raise ValueError(f"{ext} files not supported (dfs0, csv)")
+
+                times = df.index
+                coords = df.iloc[:, 0:2].values
+            else:
+                raise ValueError(f"{filename} does not exist")
+        elif isinstance(track, Dataset):
+            times = track.time
+            coords = np.zeros(shape=(len(times), 2))
+            coords[:, 0] = track.data[0]
+            coords[:, 1] = track.data[1]
+        else:
+            assert isinstance(track, pd.DataFrame)
+            times = track.index
+            coords = track.iloc[:, 0:2].values
+
+        if self.is_geo:
+            lon = coords[:, 0]
+            lon[lon < -180] = lon[lon < -180] + 360
+            lon[lon >= 180] = lon[lon >= 180] - 360
+            coords[:, 0] = lon
+
+        data_list = []
+        data_list.append(coords[:, 0])  # longitude
+        data_list.append(coords[:, 1])  # latitude
+        for item in range(n_items):
+            # Initialize an empty data block
+            data = np.empty(shape=(len(times)), dtype=self._dtype)
+            data[:] = np.nan
+            data_list.append(data)
+
+        # spatial interpolation
+        n_pts = 5
+        if method == "nearest":
+            n_pts = 1
+        elem_ids, weights = self.get_2d_interpolant(coords, n_nearest=n_pts)
+
+        # track end (relative to dfsu)
+        t_rel = (times - self.end_time).total_seconds()
+        # largest idx for which (times - self.end_time)<=0
+        i_end = np.where(t_rel <= 0)[0][-1]
+
+        # track time relative to dfsu start
+        t_rel = (times - self.start_time).total_seconds()
+        i_start = np.where(t_rel >= 0)[0][0]  # smallest idx for which t_rel>=0
+
+        dfsu_step = int(np.floor(t_rel[i_start] / self.timestep))  # first step
+
+        # initialize dfsu data arrays
+        d1 = np.ndarray(shape=(n_items, self.n_elements), dtype=self._dtype)
+        d2 = np.ndarray(shape=(n_items, self.n_elements), dtype=self._dtype)
+        t1 = 0.0
+        t2 = 0.0
+
+        # very first dfsu time step
+        step = time_steps[dfsu_step]
+        for item in range(n_items):
+            itemdata = dfs.ReadItemTimeStep(item_numbers[item] + 1, step)
+            t2 = itemdata.Time - 1e-10
+            d = to_numpy(itemdata.Data)
+            d[d == deletevalue] = np.nan
+            d2[item, :] = d
+
+        def is_EOF(step):
+            return step >= self.n_timesteps
+
+        # loop over track points
+        for i in range(i_start, i_end + 1):
+            t_rel[i]  # time of point relative to dfsu start
+
+            read_next = t_rel[i] > t2
+
+            while (read_next == True) and (~is_EOF(dfsu_step)):
+                dfsu_step = dfsu_step + 1
+
+                # swap new to old
+                d1, d2 = d2, d1
+                t1, t2 = t2, t1
+
+                step = time_steps[dfsu_step]
+                for item in range(n_items):
+                    itemdata = dfs.ReadItemTimeStep(item_numbers[item] + 1, step)
+                    t2 = itemdata.Time
+                    d = to_numpy(itemdata.Data)
+                    d[d == deletevalue] = np.nan
+                    d2[item, :] = d
+
+                read_next = t_rel[i] > t2
+
+            if (read_next == True) and (is_EOF(dfsu_step)):
+                # cannot read next - no more timesteps in dfsu file
+                continue
+
+            w = (t_rel[i] - t1) / self.timestep  # time-weight
+            eid = elem_ids[i]
+            if np.any(eid > 0):
+                dati = (1 - w) * np.dot(d1[:, eid], weights[i])
+                dati = dati + w * np.dot(d2[:, eid], weights[i])
+            else:
+                dati = np.empty(shape=n_items, dtype=self._dtype)
+                dati[:] = np.nan
+
+            for item in range(n_items):
+                data_list[item + 2][i] = dati[item]
+
+        dfs.Close()
+
+        items_out = []
+        if self.is_geo:
+            items_out.append(ItemInfo("Longitude"))
+            items_out.append(ItemInfo("Latitude"))
+        else:
+            items_out.append(ItemInfo("x"))
+            items_out.append(ItemInfo("y"))
+        for item in items:
+            items_out.append(item)
+
+        return Dataset(data_list, times, items_out)
+
+    def write_header(
+        self, filename, start_time=None, dt=None, items=None, elements=None, title=None,
+    ):
+        """Write the header of a new dfsu file
+
+            Parameters
+            -----------
+            filename: str
+                full path to the new dfsu file
+            start_time: datetime, optional
+                start datetime, default is datetime.now()
+            dt: float, optional
+                The time step (in seconds)
+            items: list[ItemInfo], optional
+            elements: list[int], optional
+                write only these element ids to file
+            title: str
+                title of the dfsu file. Default is blank.
+
+            Examples
+            --------
+            >>> msh = Mesh("foo.mesh")
+            >>> n_elements = msh.n_elements
+            >>> dfs = Dfsu(meshfilename)
+            >>> nt = 1000
+            >>> n_items = 10
+            >>> items = [ItemInfo(f"Item {i+1}") for i in range(n_items)]
+            >>> with dfs.write_header(outfilename, items=items) as f:
+            >>>     for i in range(1, nt):
+            >>>         data = []
+            >>>         for i in range(n_items):
+            >>>             d = np.random.random((1, n_elements))
+            >>>             data.append(d)
+            >>>             f.append(data)
+            """
+
+        return self.write(
+            filename=filename,
+            data=[],
+            start_time=start_time,
+            dt=dt,
+            items=items,
+            elements=elements,
+            title=title,
+            keep_open=True,
+        )
+
     def write(
         self,
         filename,
@@ -1615,6 +1985,7 @@ class Dfsu(_UnstructuredFile):
         items=None,
         elements=None,
         title=None,
+        keep_open=False,
     ):
         """Write a new dfsu file
 
@@ -1633,6 +2004,8 @@ class Dfsu(_UnstructuredFile):
             write only these element ids to file
         title: str
             title of the dfsu file. Default is blank.
+        keep_open: bool, optional
+            Keep file open for appending
         """
 
         if isinstance(data, Dataset):
@@ -1647,7 +2020,9 @@ class Dfsu(_UnstructuredFile):
             data = data.data
 
         n_items = len(data)
-        n_time_steps = np.shape(data[0])[0]
+        n_time_steps = 0
+        if n_items > 0:
+            n_time_steps = np.shape(data[0])[0]
 
         if dt is None:
             if self.timestep is None:
@@ -1668,6 +2043,10 @@ class Dfsu(_UnstructuredFile):
                 )
 
         if items is None:
+            if n_items == 0:
+                raise ValueError(
+                    "Number of items unknown. Add (..., items=[ItemInfo(...)]"
+                )
             items = [ItemInfo(f"Item {i+1}") for i in range(n_items)]
 
         if title is None:
@@ -1741,11 +2120,11 @@ class Dfsu(_UnstructuredFile):
                 )
 
         try:
-            dfs = builder.CreateFile(filename)
+            self._dfs = builder.CreateFile(filename)
         except IOError:
             print("cannot create dfsu file: ", filename)
 
-        deletevalue = dfs.DeleteValueFloat
+        deletevalue = self._dfs.DeleteValueFloat
 
         try:
             # Add data for all item-timesteps, copying from source
@@ -1754,13 +2133,44 @@ class Dfsu(_UnstructuredFile):
                     d = data[item][i, :]
                     d[np.isnan(d)] = deletevalue
                     darray = to_dotnet_float_array(d)
-                    dfs.WriteItemTimeStepNext(0, darray)
-            dfs.Close()
+                    self._dfs.WriteItemTimeStepNext(0, darray)
+            if not keep_open:
+                self._dfs.Close()
+            else:
+                return self
 
         except Exception as e:
             print(e)
-            dfs.Close()
+            self._dfs.Close()
             os.remove(filename)
+
+    def append(self, data):
+        """Append to a dfsu file opened with `write(...,keep_open=True)`
+
+        Parameters
+        -----------
+        data: list[np.array]
+        """
+
+        deletevalue = self._dfs.DeleteValueFloat
+        n_items = len(data)
+        n_time_steps = np.shape(data[0])[0]
+        for i in range(n_time_steps):
+            for item in range(n_items):
+                d = data[item][i, :]
+                d[np.isnan(d)] = deletevalue
+                darray = to_dotnet_float_array(d)
+                self._dfs.WriteItemTimeStepNext(0, darray)
+
+    def close(self):
+        "Finalize write for a dfsu file opened with `write(...,keep_open=True)`"
+        self._dfs.Close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type, value, traceback):
+        self._dfs.Close()
 
     def to_mesh(self, outfilename):
         """write object to mesh file
