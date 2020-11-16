@@ -11,7 +11,7 @@ from .dfs import _Dfs123
 
 
 class Dfs2(_Dfs123):
-
+    
     _ndim = 2
     _dx = None
     _dy = None
