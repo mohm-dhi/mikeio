@@ -15,8 +15,10 @@ from DHI.Generic.MikeZero.DFS import (
 )
 from DHI.Generic.MikeZero.DFS.dfs0 import Dfs0Util
 
+from .custom_exceptions import ItemNumbersError, InvalidDataType
 from .dotnet import to_dotnet_array, to_dotnet_datetime, from_dotnet_datetime
-from .dutil import Dataset, get_valid_items_and_timesteps, get_item_info
+from .dutil import get_valid_items_and_timesteps, get_item_info
+from .dataset import Dataset
 from .eum import TimeStepUnit, EUMType, EUMUnit, ItemInfo, TimeAxisType
 from .helpers import safe_length
 
@@ -45,10 +47,9 @@ class Dfs0:
             self._read_header()
 
     def __repr__(self):
-        out = ["Dfs0"]
+        out = ["<mikeio.Dfs0>"]
 
         if self._filename:
-
             out.append(f"Timeaxis: {str(self._timeaxistype)}")
 
         if self._n_items is not None:
@@ -63,7 +64,7 @@ class Dfs0:
 
     def _read_header(self):
         if not os.path.exists(self._filename):
-            raise FileNotFoundError(f"File {self._filename} not found.")
+            raise FileNotFoundError(self._filename)
 
         dfs = DfsFileFactory.DfsGenericOpen(self._filename)
         self._deletevalue = dfs.FileInfo.DeleteValueFloat
@@ -72,9 +73,15 @@ class Dfs0:
         self._n_items = safe_length(dfs.ItemInfo)
         self._items = get_item_info(dfs, list(range(self._n_items)))
 
-        # Read time
-        self._start_time = from_dotnet_datetime(dfs.FileInfo.TimeAxis.StartDateTime)
         self._timeaxistype = TimeAxisType(dfs.FileInfo.TimeAxis.TimeAxisType)
+
+        if self._timeaxistype in [
+            TimeAxisType.EquidistantCalendar,
+            TimeAxisType.NonEquidistantCalendar,
+        ]:
+            self._start_time = from_dotnet_datetime(dfs.FileInfo.TimeAxis.StartDateTime)
+        else:  # relative time axis
+            self._start_time = datetime(1970, 1, 1)
 
         dfs.Close()
 
@@ -145,7 +152,7 @@ class Dfs0:
         return data
 
     def __get_time(self, raw_data):
-        start_time = from_dotnet_datetime(self._dfs.FileInfo.TimeAxis.StartDateTime)
+        start_time = self.start_time
 
         for t in range(self._n_timesteps):
             t_sec = raw_data[t, self._time_column_index]
@@ -164,33 +171,7 @@ class Dfs0:
             isinstance(item_number, int) and 0 <= item_number < 1e15
             for item_number in item_numbers
         ):
-            raise ValueError(
-                "'item_numbers' must be a list or array of values between 0 and 1e15"
-            )
-
-    @staticmethod
-    def _validate_and_open_dfs(filename, data):
-        if not os.path.exists(filename):
-            raise FileNotFoundError(f"File {filename} not found.")
-
-        try:
-            dfs = DfsFileFactory.DfsGenericOpenEdit(filename)
-        except IOError:
-            raise IOError(f"Cannot open {filename}.")
-
-        n_items = len(dfs.ItemInfo)
-        n_time_steps = dfs.FileInfo.TimeAxis.NumberOfTimeSteps
-
-        # Match the data to write to the existing dfs0 file
-        if n_time_steps != data[0].shape[0]:
-            raise ValueError(
-                f"Inconsistent data size. Number of time steps (row count) is {data[0].shape[0]}. Expected {n_time_steps}."
-            )
-
-        if n_items != len(data):
-            raise ValueError(f"The number of items is {len(data)}. Expected {n_items}.")
-
-        return dfs, n_items, n_time_steps
+            raise ItemNumbersError()
 
     @staticmethod
     def _to_dfs_datatype(dtype):
@@ -203,7 +184,7 @@ class Dfs0:
         if dtype in (np.float32, DfsSimpleType.Float, "float", "single"):
             return DfsSimpleType.Float
 
-        raise ValueError("Invalid data type. Choose np.float32 or np.float64")
+        raise InvalidDataType()
 
     def _setup_header(self):
         factory = DfsFactory()
@@ -316,7 +297,7 @@ class Dfs0:
             self._start_time = start_time
 
         self._n_items = len(data)
-        self._n_time_steps = np.shape(data[0])[0]
+        self._n_timesteps = np.shape(data[0])[0]
 
         if items:
             self._items = items
@@ -343,7 +324,7 @@ class Dfs0:
             datetimes = np.array(
                 [
                     self._start_time + timedelta(seconds=(step * self._dt))
-                    for step in np.arange(self._n_time_steps)
+                    for step in np.arange(self._n_timesteps)
                 ]
             )
 
@@ -508,3 +489,27 @@ def dataframe_to_dfs0(
 
 
 pd.DataFrame.to_dfs0 = dataframe_to_dfs0
+
+
+def dataset_to_dfs0(self, filename):
+    """Write Dataset to a Dfs0 file
+        
+        Parameters
+        ----------
+        filename: str
+            full path and file name to the dfs0 file.
+        """
+    self = self.squeeze()
+
+    if len(self.data[0].shape) != 1:
+        raise ValueError(
+            """Only data with a single dimension can be converted to a dfs0.
+                 Hint: use `isel` to create a subset."""
+        )
+
+    dfs0 = Dfs0()
+
+    dfs0.write(filename, self)
+
+
+Dataset.to_dfs0 = dataset_to_dfs0

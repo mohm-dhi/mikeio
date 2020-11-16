@@ -5,13 +5,12 @@ with open("README.md", "r") as fh:
 
 setuptools.setup(
     name="mikeio",
-    version="0.5.3",
-    install_requires=["pythonnet", "numpy", "pandas", "scipy"],
+    version="0.6.1_dev",
+    install_requires=["pythonnet", "numpy", "pandas", "scipy", "pyyaml"],
     extras_require={
         "dev": [
             "pytest",
             "black",
-            "sphinx",
             "sphinx",
             "sphinx-rtd-theme",
             "shapely",
@@ -20,11 +19,11 @@ setuptools.setup(
             "matplotlib",
             "jupyterlab",
         ],
-        "test": ["pytest"],
+        "test": ["pytest", "matplotlib", "shapely"],
     },
     author="Henrik Andersson",
     author_email="jan@dhigroup.com",
-    description="A package that works with the DHI dfs libraries to facilitate creating, writing and reading dfs, res1d and mesh files.",
+    description="A package that uses the DHI dfs libraries to create, write and read dfs, res1d and mesh files.",
     platform="windows_x64",
     license="MIT",
     long_description=long_description,

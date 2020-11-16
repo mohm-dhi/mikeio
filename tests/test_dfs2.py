@@ -1,9 +1,14 @@
 import os
 import datetime
 import numpy as np
+import pytest
 from mikeio.dfs2 import Dfs2
 from mikeio.eum import EUMType, ItemInfo, EUMUnit
-import pytest
+from mikeio.custom_exceptions import (
+    DataDimensionMismatch,
+    InvalidDataType,
+    ItemNumbersError,
+)
 
 
 def test_simple_write(tmpdir):
@@ -29,6 +34,26 @@ def test_simple_write(tmpdir):
 
     assert len(ds) == 1
     assert ds.items[0].type == EUMType.Undefined
+
+
+def test_write_inconsistent_shape(tmpdir):
+
+    filename = os.path.join(tmpdir.dirname, "simple.dfs2")
+
+    data = []
+
+    nt = 100
+    nx = 20
+    ny = 5
+    d1 = np.random.random([nt, ny, nx])
+    d2 = np.random.random([nt, ny, nx + 1])
+
+    data = [d1, d2]
+
+    dfs = Dfs2()
+
+    with pytest.raises(DataDimensionMismatch):
+        dfs.write(filename=filename, data=data)
 
 
 def test_write_single_item(tmpdir):
@@ -72,35 +97,6 @@ def test_write_single_item(tmpdir):
     assert newdfs.dy == 200.0
 
 
-def test_non_equidistant_calendar(tmpdir):
-
-    filename = os.path.join(tmpdir.dirname, "simple.dfs2")
-
-    data = []
-
-    datetimes = [
-        datetime.datetime(2012, 1, 1),
-        datetime.datetime(2012, 2, 1),
-        datetime.datetime(2012, 2, 10),
-    ]
-
-    nt = len(datetimes)
-    nx = 20
-    ny = 5
-    d = np.random.random([nt, ny, nx])
-
-    data.append(d)
-
-    dfs = Dfs2()
-
-    dfs.write(filename=filename, data=data, datetimes=datetimes)
-
-    newdfs = Dfs2(filename)
-    ds = newdfs.read()
-
-    assert not ds.is_equidistant
-
-
 def test_read():
 
     filename = r"tests/testdata/random.dfs2"
@@ -110,6 +106,15 @@ def test_read():
     assert data[0, 11, 0] == 0
     assert np.isnan(data[0, 10, 0])
     assert data.shape == (3, 100, 2)  # time, y, x
+
+
+def test_read_bad_item():
+
+    filename = r"tests/testdata/random.dfs2"
+    dfs = Dfs2(filename)
+
+    with pytest.raises(ItemNumbersError):
+        dfs.read(items=100)
 
 
 def test_read_temporal_subset_slice():
@@ -181,6 +186,15 @@ def test_repr():
     assert "dx" in text
 
 
+def test_repr_empty():
+
+    dfs = Dfs2()
+
+    text = repr(dfs)
+
+    assert "Dfs2" in text
+
+
 def test_repr_time():
 
     filename = r"tests/testdata/random.dfs2"
@@ -221,6 +235,31 @@ def test_read_some_time_step():
 
     assert res.data[0].shape[0] == 2
     assert len(res.time) == 2
+
+
+def test_interpolate_non_equidistant_data(tmpdir):
+
+    filename = r"tests/testdata/eq.dfs2"
+    dfs = Dfs2(filename)
+
+    ds = dfs.read(time_steps=[0, 2, 3, 6])  # non-equidistant dataset
+
+    assert not ds.is_equidistant
+
+    ds2 = ds.interp_time(dt=3600)
+
+    assert ds2.is_equidistant
+
+    outfilename = os.path.join(tmpdir.dirname, "interpolated_time.dfs2")
+
+    dfs.write(outfilename, ds2)
+
+    dfs2 = Dfs2(outfilename)
+    assert dfs2.timestep == 3600.0
+
+    ds3 = dfs2.read()
+
+    assert ds3.is_equidistant
 
 
 def test_write_some_time_step(tmpdir):
@@ -271,3 +310,55 @@ def test_find_index_from_coordinate():
 
     assert i == 263
     assert j == 215
+
+
+def test_reproject(tmpdir):
+
+    filename = "tests/testdata/gebco_sound.dfs2"
+
+    dfs = Dfs2(filename)
+
+    assert dfs.projection_string == "LONG/LAT"
+    outfilename = os.path.join(tmpdir.dirname, "utm.dfs2")
+
+    longitude_origin = dfs.longitude
+    latitude_origin = dfs.latitude
+
+    dfs.reproject(
+        outfilename,
+        projectionstring="UTM-33",
+        longitude_origin=longitude_origin,
+        latitude_origin=latitude_origin,
+        dx=200.0,
+        dy=200.0,
+        nx=285,
+        ny=612,
+        interpolate=False,
+    )
+
+    newdfs = Dfs2(outfilename)
+    assert "UTM-33" in newdfs.projection_string
+    assert newdfs.shape == (1, 612, 285)
+    assert dfs.start_time == newdfs.start_time
+    assert dfs.projection_string != newdfs.projection_string
+
+
+def test_reproject_defaults(tmpdir):
+
+    filename = "tests/testdata/gebco_sound.dfs2"
+
+    dfs = Dfs2(filename)
+
+    assert dfs.projection_string == "LONG/LAT"
+    outfilename = os.path.join(tmpdir.dirname, "utm2.dfs2")
+
+    dfs.reproject(
+        outfilename, projectionstring="UTM-33", dx=200.0, dy=200.0,
+    )
+
+    newdfs = Dfs2(outfilename)
+    assert "UTM-33" in newdfs.projection_string
+    assert newdfs.shape == dfs.shape
+    assert dfs.start_time == newdfs.start_time
+    assert dfs.projection_string != newdfs.projection_string
+
