@@ -46,6 +46,7 @@ class Dfs123:
         self._latitude = dfs.FileInfo.Projection.Latitude
         self._orientation = dfs.FileInfo.Projection.Orientation
         self._deletevalue = dfs.FileInfo.DeleteValueFloat
+        self._dt = dfs.FileInfo.TimeAxis.TimeStep
 
         dfs.Close()
 

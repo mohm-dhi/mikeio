@@ -40,6 +40,7 @@ class Dfs2(Dfs123):
         if self._filename:
             out.append(f"dx: {self.dx:.5f}")
             out.append(f"dy: {self.dy:.5f}")
+            out.append(f"dt: {self.dt:.5f}")
 
         if self._n_items is not None:
             if self._n_items < 10:
@@ -98,6 +99,8 @@ class Dfs2(Dfs123):
 
         (int,int): indexes in y, x 
         """
+        dfs = DfsFileFactory.Dfs2FileOpen(self._filename)
+        self._dfs = dfs
         projection = self._dfs.FileInfo.Projection
         axis = self._dfs.SpatialAxis
         cart = Cartography(
@@ -327,4 +330,10 @@ class Dfs2(Dfs123):
         """Step size in y direction
         """
         return self._dy
+
+    @property
+    def dt(self):
+        """Step size in y direction
+        """
+        return self._dt
 
